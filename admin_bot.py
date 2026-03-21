@@ -302,6 +302,7 @@ def handle_update(update: dict) -> dict:
         modal.Secret.from_name("google-oauth-app"),
         modal.Secret.from_name("modal-api-token"),
         modal.Secret.from_name("telegram-notifier"),
+        modal.Secret.from_name("github-api-token"),
     ],
     timeout=180,
 )
@@ -310,6 +311,8 @@ def oauth_callback(code: str = None, state: str = "klient", error: str = None):
     import os, json, urllib.parse, urllib.request, requests, time
 
     bot_token = os.environ["TELEGRAM_BOT_TOKEN"]
+    github_token = os.environ["GITHUB_TOKEN"]
+    github_repo = os.environ["GITHUB_REPO"]
     chat_id = os.environ["TELEGRAM_CHAT_ID"]
     client_id = os.environ["GOOGLE_CLIENT_ID"]
     client_secret = os.environ["GOOGLE_CLIENT_SECRET"]
@@ -359,6 +362,15 @@ def oauth_callback(code: str = None, state: str = "klient", error: str = None):
     n = state.lower()
     secret_name = f"google-calendar-credentials-{n}"
     ok = _modal_secret(secret_name, {"GOOGLE_CALENDAR_CREDENTIALS": json.dumps(credentials)}, modal_id, modal_secret_val)
+
+    # Trigger redeploy via GitHub to restart containers with fresh credentials
+    _github_file(
+        repo=github_repo,
+        path=f"clients/{n}.py",
+        content=_build_client_file(n, admin_state.get("clients", {}).get(n, {}).get("interface", "slack")),
+        token=github_token,
+        message=f"Redeploy {n} after OAuth",
+    )
 
     # Get bearer token from admin_state (stored during _provision_client)
     clients_map = admin_state.get("clients", {})
