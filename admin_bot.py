@@ -132,7 +132,24 @@ def _provision_client(
     n = name.lower()
     _tg(bot_token, chat_id, f"⏳ Skapar *{name.capitalize()}*...")
 
-    # 1. Push clients/{n}.py to GitHub → triggers GitHub Actions deploy
+    # 1. Generate bearer token + store ALL credentials in admin_state BEFORE GitHub push
+    # deploy.py reads from admin_state to create Modal secrets — no REST API needed
+    auth_token = secrets.token_hex(32)
+    clients_map = admin_state.get("clients", {})
+    clients_map[n] = {
+        "auth_token": auth_token,
+        "interface": interface,
+        "tg_token": tg_token if interface == "telegram" else None,
+        "tg_chat": tg_chat if interface == "telegram" else None,
+    }
+    admin_state["clients"] = clients_map
+
+    # 2. Set Telegram webhook
+    if interface == "telegram" and tg_token and tg_chat:
+        webhook_url = f"https://{WORKSPACE}--calendar-{n}-telegram-webhook.modal.run"
+        _set_webhook(tg_token, webhook_url)
+
+    # 3. Push clients/{n}.py to GitHub → triggers GitHub Actions deploy
     ok = _github_file(
         repo=github_repo,
         path=f"clients/{n}.py",
@@ -146,24 +163,7 @@ def _provision_client(
 
     _tg(bot_token, chat_id, f"✅ `clients/{n}.py` pushad — GitHub Actions deployas (~2 min)...")
 
-    # 2. Create bearer token secret (single source of truth — deploy.py must NOT create this)
-    auth_token = secrets.token_hex(32)
-    ok = _modal_secret(f"api-auth-token-{n}", {"API_AUTH_TOKEN": auth_token}, modal_id, modal_secret_val)
-    if not ok:
-        _tg(bot_token, chat_id, f"❌ Kunde inte skapa bearer token för *{name.capitalize()}*. Kontrollera `modal-api-token`.")
-        return
-
-    # 3. Telegram: store bot creds + set webhook (webhook URL = after deploy)
-    if interface == "telegram" and tg_token and tg_chat:
-        _modal_secret(
-            f"telegram-client-{n}",
-            {"TELEGRAM_BOT_TOKEN": tg_token, "TELEGRAM_CHAT_ID": tg_chat},
-            modal_id, modal_secret_val,
-        )
-        webhook_url = f"https://{WORKSPACE}--calendar-{n}-telegram-webhook.modal.run"
-        _set_webhook(tg_token, webhook_url)
-
-    # 4. Build OAuth URL (universal callback)
+    # 4. Build OAuth URL
     params = {
         "client_id": client_id,
         "redirect_uri": OAUTH_CALLBACK_URL,
@@ -174,11 +174,6 @@ def _provision_client(
         "state": n,
     }
     oauth_url = "https://accounts.google.com/o/oauth2/v2/auth?" + urllib.parse.urlencode(params)
-
-    # 5. Store auth_token in admin_state for cURL generation after OAuth
-    clients_map = admin_state.get("clients", {})
-    clients_map[n] = {"auth_token": auth_token, "interface": interface}
-    admin_state["clients"] = clients_map
 
     iface_note = "Telegram webhook satt ✅" if interface == "telegram" else "Slack — klistra in cURL i n8n"
     _tg(
