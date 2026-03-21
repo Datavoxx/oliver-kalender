@@ -24,6 +24,26 @@ def _tg(bot_token: str, chat_id: str, text: str) -> None:
         pass
 
 
+def _tg_button(bot_token: str, chat_id: str, text: str, button_label: str, button_url: str) -> None:
+    """Send a message with an inline URL button — URL is never touched by Telegram's parser."""
+    import requests
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{bot_token}/sendMessage",
+            json={
+                "chat_id": chat_id,
+                "text": text,
+                "parse_mode": "Markdown",
+                "reply_markup": {
+                    "inline_keyboard": [[{"text": button_label, "url": button_url}]]
+                },
+            },
+            timeout=10,
+        )
+    except Exception:
+        pass
+
+
 def _modal_secret(name: str, env_vars: dict, token_id: str, token_secret: str) -> bool:
     import requests
     try:
@@ -126,9 +146,12 @@ def _provision_client(
 
     _tg(bot_token, chat_id, f"✅ `clients/{n}.py` pushad — GitHub Actions deployas (~2 min)...")
 
-    # 2. Create bearer token secret
+    # 2. Create bearer token secret (single source of truth — deploy.py must NOT create this)
     auth_token = secrets.token_hex(32)
-    _modal_secret(f"api-auth-token-{n}", {"API_AUTH_TOKEN": auth_token}, modal_id, modal_secret_val)
+    ok = _modal_secret(f"api-auth-token-{n}", {"API_AUTH_TOKEN": auth_token}, modal_id, modal_secret_val)
+    if not ok:
+        _tg(bot_token, chat_id, f"❌ Kunde inte skapa bearer token för *{name.capitalize()}*. Kontrollera `modal-api-token`.")
+        return
 
     # 3. Telegram: store bot creds + set webhook (webhook URL = after deploy)
     if interface == "telegram" and tg_token and tg_chat:
@@ -162,8 +185,13 @@ def _provision_client(
         bot_token, chat_id,
         f"*{name.capitalize()} är redo!*\n\n"
         f"🔑 Bearer: `{auth_token}`\n"
-        f"📲 {iface_note}\n\n"
-        f"🔗 *Skicka den här OAuth-länken till {name.capitalize()}:*\n{oauth_url}",
+        f"📲 {iface_note}",
+    )
+    _tg_button(
+        bot_token, chat_id,
+        f"🔗 Skicka den här länken till {name.capitalize()}:",
+        button_label=f"Koppla Google Calendar ({name.capitalize()})",
+        button_url=oauth_url,
     )
 
 
@@ -307,8 +335,18 @@ def oauth_callback(code: str = None, state: str = "klient", error: str = None):
         data=token_data, method="POST",
         headers={"Content-Type": "application/x-www-form-urlencoded"},
     )
-    with urllib.request.urlopen(req) as resp:
-        tokens = json.loads(resp.read())
+    try:
+        with urllib.request.urlopen(req) as resp:
+            tokens = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode()
+        _tg(bot_token, chat_id,
+            f"❌ Google token-fel ({e.code}):\n`{error_body}`\n\n"
+            f"redirect\\_uri: `{OAUTH_CALLBACK_URL}`")
+        return HTMLResponse(
+            f"<h1>Fel vid token-utbyte ({e.code})</h1><p>{error_body}</p>",
+            status_code=400,
+        )
 
     credentials = {
         "access_token": tokens.get("access_token", ""),
@@ -328,8 +366,27 @@ def oauth_callback(code: str = None, state: str = "klient", error: str = None):
     auth_token = client_info.get("auth_token", "OKÄNT")
     interface = client_info.get("interface", "slack")
 
-    # Build cURL
+    # Wait for the Modal app to be live (GitHub Actions may still be deploying)
+    import time
     handle_url = f"https://{WORKSPACE}--calendar-{n}-handle-message.modal.run"
+    app_ready = False
+    for attempt in range(5):
+        try:
+            r = requests.post(
+                handle_url,
+                headers={"Authorization": f"Bearer {auth_token}", "Content-Type": "application/json"},
+                json={"message": "ping", "user_id": "health-check"},
+                timeout=10,
+            )
+            if r.status_code != 404:  # 200 or 403 = app is running
+                app_ready = True
+                break
+        except Exception:
+            pass
+        if attempt < 4:
+            time.sleep(15)
+
+    # Build cURL
     curl_cmd = (
         f'curl -X POST "{handle_url}" \\\n'
         f'  -H "Content-Type: application/json" \\\n'
@@ -339,6 +396,11 @@ def oauth_callback(code: str = None, state: str = "klient", error: str = None):
 
     status = "✅ Secret skapad!" if ok else "❌ Secret-fel — kontrollera modal-api-token"
     iface_note = "Telegram-boten är aktiv ✅" if interface == "telegram" else "Klistra in cURL i n8n"
+
+    if not app_ready:
+        _tg(bot_token, chat_id,
+            f"⚠️ *{state.capitalize()}* — OAuth klart men appen svarar inte än.\n"
+            f"GitHub Actions kanske inte kört klart. Vänta 2 min och försök sedan med cURL nedan.")
 
     _tg(
         bot_token, chat_id,
