@@ -64,6 +64,7 @@ Required fields:
 1. subject — what is the event about? Derive: title (3-6 word professional version) + description (2-3 full sentences)
    INTENT-ONLY RULE: Generic phrases like "boka ett event", "boka något" — subject is missing, ask: "Vad handlar eventet om?"
    SINGLE GENERIC WORD RULE: "möte", "lunch", "middag" without context → ask: "Vad handlar mötet om?"
+   CONTACT INFO RULE: If the message contains a phone number, email, or other contact info — ALWAYS include it at the very top of the description field. Format: "📞 [number]\n\n" followed by the rest of the description. Never discard contact info.
 2. date, start_time, end_time — if ANY missing, ask in ONE question: "Vilket datum och vilken tid? (t.ex. 14/4 kl 10–12)"
    CRITICAL: NEVER infer date/time from context. If not stated, ask.
 
