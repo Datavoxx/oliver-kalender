@@ -303,7 +303,7 @@ def handle_update(update: dict) -> dict:
         modal.Secret.from_name("modal-api-token"),
         modal.Secret.from_name("telegram-notifier"),
     ],
-    timeout=60,
+    timeout=180,
 )
 @modal.fastapi_endpoint(method="GET")
 def oauth_callback(code: str = None, state: str = "klient", error: str = None):
@@ -370,7 +370,7 @@ def oauth_callback(code: str = None, state: str = "klient", error: str = None):
     import time
     handle_url = f"https://{WORKSPACE}--calendar-{n}-handle-message.modal.run"
     app_ready = False
-    for attempt in range(5):
+    for attempt in range(6):
         try:
             r = requests.post(
                 handle_url,
@@ -383,8 +383,8 @@ def oauth_callback(code: str = None, state: str = "klient", error: str = None):
                 break
         except Exception:
             pass
-        if attempt < 4:
-            time.sleep(15)
+        if attempt < 5:
+            time.sleep(20)
 
     # Build cURL
     curl_cmd = (
