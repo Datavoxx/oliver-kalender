@@ -13,8 +13,8 @@ jobs:
         with:
           fetch-depth: 2
 
-      - name: Install Modal
-        run: pip install modal
+      - name: Install dependencies
+        run: pip install modal fastapi
 
       - name: Deploy changed clients
         run: |
