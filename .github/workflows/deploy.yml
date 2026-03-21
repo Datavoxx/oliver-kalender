@@ -1,0 +1,28 @@
+name: Deploy client
+
+on:
+  push:
+    paths:
+      - 'clients/*.py'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Install Modal
+        run: pip install modal
+
+      - name: Deploy changed clients
+        run: |
+          for f in $(git diff --name-only HEAD~1 HEAD -- 'clients/*.py'); do
+            client=$(basename "$f" .py)
+            echo "Deploying $client..."
+            python deploy.py "$client"
+          done
+        env:
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}

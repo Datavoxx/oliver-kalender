@@ -10,6 +10,9 @@ __pycache__/
 *.pyo
 *.pyd
 
+# Auto-generated deploy config (never commit)
+config.py
+
 # Claude internal
 MEMORY.md
 CLAUDE (1).md
