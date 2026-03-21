@@ -1,23 +1,25 @@
 import modal
+import config
 from fastapi import Header, HTTPException
 from datetime import datetime, timezone
 
-app = modal.App("calendar-orchestrator")
+app = modal.App(config.MODAL_APP_NAME)
 image = (
     modal.Image.debian_slim()
     .pip_install("openai", "fastapi", "google-auth", "google-auth-httplib2", "requests")
     .add_local_python_source("lib")
+    .add_local_python_source("config")
 )
 
-orchestrator_state = modal.Dict.from_name("orchestrator-state", create_if_missing=True)
+orchestrator_state = modal.Dict.from_name(config.MODAL_DICT_NAME, create_if_missing=True)
 
 
 @app.function(
     image=image,
     secrets=[
-        modal.Secret.from_name("openai-api-key"),
-        modal.Secret.from_name("api-auth-token"),
-        modal.Secret.from_name("google-calendar-credentials"),
+        modal.Secret.from_name(config.MODAL_SECRET_OPENAI),
+        modal.Secret.from_name(config.MODAL_SECRET_AUTH),
+        modal.Secret.from_name(config.MODAL_SECRET_GOOGLE),
     ],
     timeout=60,
     min_containers=1,
@@ -225,8 +227,8 @@ def handle_message(data: dict, authorization: str = Header(None)) -> dict:
             event_body: dict = {
                 "summary": fields.get("title") or fields.get("summary"),
                 "description": fields.get("description", ""),
-                "start": {"dateTime": fields["start_datetime"], "timeZone": "Europe/Stockholm"},
-                "end": {"dateTime": fields["end_datetime"], "timeZone": "Europe/Stockholm"},
+                "start": {"dateTime": fields["start_datetime"], "timeZone": config.TIMEZONE},
+                "end": {"dateTime": fields["end_datetime"], "timeZone": config.TIMEZONE},
                 "reminders": {
                     "useDefault": False,
                     "overrides": [
@@ -261,9 +263,9 @@ def handle_message(data: dict, authorization: str = Header(None)) -> dict:
             if "summary" in changes:
                 patch_body["summary"] = changes["summary"]
             if "start_datetime" in changes:
-                patch_body["start"] = {"dateTime": changes["start_datetime"], "timeZone": "Europe/Stockholm"}
+                patch_body["start"] = {"dateTime": changes["start_datetime"], "timeZone": config.TIMEZONE}
             if "end_datetime" in changes:
-                patch_body["end"] = {"dateTime": changes["end_datetime"], "timeZone": "Europe/Stockholm"}
+                patch_body["end"] = {"dateTime": changes["end_datetime"], "timeZone": config.TIMEZONE}
             if "description" in changes:
                 patch_body["description"] = changes["description"]
             if "location" in changes:
@@ -307,3 +309,109 @@ def handle_message(data: dict, authorization: str = Header(None)) -> dict:
         reply = "Klart!"
 
     return _save_and_reply(reply, default_state(new_history, last_reply=reply), reset_conversation=True)
+
+
+# ── OAuth endpoints ────────────────────────────────────────────────────────────
+
+_oauth_image = (
+    modal.Image.debian_slim()
+    .pip_install("fastapi")
+    .add_local_python_source("config")
+)
+
+
+@app.function(
+    image=_oauth_image,
+    secrets=[modal.Secret.from_name(config.MODAL_SECRET_OAUTH)],
+)
+@modal.fastapi_endpoint(method="GET")
+def auth_start():
+    """
+    Steg 1: Skicka denna URL till klienten.
+    De klickar → loggar in med Google → godkänner → skickas till auth_callback.
+    """
+    import os, urllib.parse
+    from fastapi.responses import RedirectResponse, HTMLResponse
+
+    if not config.AUTH_CALLBACK_URL:
+        return HTMLResponse(
+            "<h1>Sätt AUTH_CALLBACK_URL i config.py och redeploya.</h1>"
+            "<p>Callback-URL:en ser ut så här:<br>"
+            f"<code>https://[workspace]--{config.MODAL_APP_NAME}-auth-callback.modal.run</code></p>",
+            status_code=400,
+        )
+
+    params = {
+        "client_id": os.environ["GOOGLE_CLIENT_ID"],
+        "redirect_uri": config.AUTH_CALLBACK_URL,
+        "response_type": "code",
+        "scope": "https://www.googleapis.com/auth/calendar",
+        "access_type": "offline",
+        "prompt": "consent",
+    }
+    url = "https://accounts.google.com/o/oauth2/v2/auth?" + urllib.parse.urlencode(params)
+    return RedirectResponse(url)
+
+
+@app.function(
+    image=_oauth_image,
+    secrets=[modal.Secret.from_name(config.MODAL_SECRET_OAUTH)],
+)
+@modal.fastapi_endpoint(method="GET")
+def auth_callback(code: str = None, error: str = None):
+    """
+    Steg 2: Google redirectar hit efter att klienten godkänt.
+    Visar credentials-JSON som klienten kopierar till modal.com/secrets.
+    """
+    import os, json, urllib.parse, urllib.request
+    from fastapi.responses import HTMLResponse
+
+    if error:
+        return HTMLResponse(f"<h1>Google-fel: {error}</h1>", status_code=400)
+    if not code:
+        return HTMLResponse("<h1>Ingen auth-kod mottagen.</h1>", status_code=400)
+
+    client_id = os.environ["GOOGLE_CLIENT_ID"]
+    client_secret = os.environ["GOOGLE_CLIENT_SECRET"]
+
+    token_data = urllib.parse.urlencode({
+        "code": code,
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "redirect_uri": config.AUTH_CALLBACK_URL,
+        "grant_type": "authorization_code",
+    }).encode()
+
+    req = urllib.request.Request(
+        "https://oauth2.googleapis.com/token",
+        data=token_data,
+        method="POST",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    with urllib.request.urlopen(req) as resp:
+        tokens = json.loads(resp.read())
+
+    credentials = {
+        "access_token": tokens.get("access_token", ""),
+        "refresh_token": tokens.get("refresh_token", ""),
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "calendar_id": "primary",
+    }
+    creds_json = json.dumps(credentials, indent=2)
+    secret_name = config.MODAL_SECRET_GOOGLE
+    modal_cmd = f"modal secret create {secret_name} GOOGLE_CALENDAR_CREDENTIALS='{json.dumps(credentials)}'"
+
+    html = f"""<!DOCTYPE html>
+<html><body style="font-family:sans-serif;padding:2rem;max-width:700px;margin:auto">
+<h1>Google-konto kopplat!</h1>
+<p>Kopiera JSON nedan och klistra in på
+<a href="https://modal.com/secrets" target="_blank">modal.com/secrets</a>
+som en ny secret med namnet <code>{secret_name}</code>
+(variabelnamn: <code>GOOGLE_CALENDAR_CREDENTIALS</code>):</p>
+<pre style="background:#f4f4f4;padding:1rem;border-radius:6px;overflow-x:auto">{creds_json}</pre>
+<hr>
+<p><strong>Eller</strong> kör detta i terminalen:</p>
+<pre style="background:#f4f4f4;padding:1rem;border-radius:6px;overflow-x:auto">{modal_cmd}</pre>
+</body></html>"""
+    return HTMLResponse(html)

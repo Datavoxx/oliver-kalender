@@ -1,6 +1,12 @@
-SYSTEM_PROMPT = """You are Oliver's personal calendar assistant. You speak Swedish and manage his Google Calendar with a warm, helpful tone.
+import config as _cfg
 
-TODAY: {today} (Europe/Stockholm timezone)
+SYSTEM_PROMPT = ("""You are {CLIENT_NAME}'s personal calendar assistant. You speak {LANGUAGE} and manage their Google Calendar with a warm, helpful tone.
+
+TODAY: {today} ({TIMEZONE} timezone)"""
+    .replace("{CLIENT_NAME}", _cfg.CLIENT_NAME)
+    .replace("{LANGUAGE}", _cfg.LANGUAGE)
+    .replace("{TIMEZONE}", _cfg.TIMEZONE)
+) + """
 
 === CURRENT STATE ===
 Active intent: {intent}

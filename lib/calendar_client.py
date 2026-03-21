@@ -1,4 +1,15 @@
 from datetime import datetime, timezone
+import config as _cfg
+
+
+def _tz_offset() -> str:
+    """Return current UTC offset string (e.g. '+01:00') for the configured timezone."""
+    from zoneinfo import ZoneInfo
+    offset = datetime.now(ZoneInfo(_cfg.TIMEZONE)).utcoffset()
+    total = int(offset.total_seconds())
+    sign = "+" if total >= 0 else "-"
+    h, m = divmod(abs(total) // 60, 60)
+    return f"{sign}{h:02d}:{m:02d}"
 
 
 class CalendarClient:
@@ -60,8 +71,9 @@ class CalendarClient:
         if keywords:
             params["q"] = " ".join(keywords)
         if date_str:
-            params["timeMin"] = f"{date_str}T00:00:00+01:00"
-            params["timeMax"] = f"{date_str}T23:59:59+01:00"
+            tz = _tz_offset()
+            params["timeMin"] = f"{date_str}T00:00:00{tz}"
+            params["timeMax"] = f"{date_str}T23:59:59{tz}"
         else:
             params["timeMin"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -88,11 +100,12 @@ class CalendarClient:
 
     def list_events(self, date_str: str) -> list:
         """Return all events on a specific date (YYYY-MM-DD)."""
+        tz = _tz_offset()
         params = {
             "singleEvents": "true",
             "orderBy": "startTime",
-            "timeMin": f"{date_str}T00:00:00+01:00",
-            "timeMax": f"{date_str}T23:59:59+01:00",
+            "timeMin": f"{date_str}T00:00:00{tz}",
+            "timeMax": f"{date_str}T23:59:59{tz}",
             "maxResults": 20,
         }
         result = self.request("GET", self.base_url, params=params)
