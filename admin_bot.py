@@ -307,7 +307,7 @@ def handle_update(update: dict) -> dict:
 )
 @modal.fastapi_endpoint(method="GET")
 def oauth_callback(code: str = None, state: str = "klient", error: str = None):
-    import os, json, urllib.parse, urllib.request
+    import os, json, urllib.parse, urllib.request, requests, time
 
     bot_token = os.environ["TELEGRAM_BOT_TOKEN"]
     chat_id = os.environ["TELEGRAM_CHAT_ID"]
