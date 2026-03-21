@@ -96,13 +96,12 @@ def _set_webhook(bot_token: str, url: str) -> bool:
         return False
 
 
-def _build_client_file(name: str, interface: str) -> str:
+def _build_client_file(name: str) -> str:
     n = name.lower()
     lines = [
         f'CLIENT_NAME = "{name.capitalize()}"',
         f'TIMEZONE    = "Europe/Stockholm"',
         f'LANGUAGE    = "Swedish"',
-        f'INTERFACE   = "{interface}"',
         f'',
         f'MODAL_APP_NAME  = "calendar-{n}"',
         f'MODAL_DICT_NAME = "{n}-state"',
@@ -110,18 +109,12 @@ def _build_client_file(name: str, interface: str) -> str:
         f'MODAL_SECRET_OPENAI    = "openai-api-key"',
         f'MODAL_SECRET_AUTH      = "api-auth-token-{n}"',
         f'MODAL_SECRET_GOOGLE    = "google-calendar-credentials-{n}"',
-        f'MODAL_SECRET_OAUTH     = "google-oauth-app"',
     ]
-    if interface == "telegram":
-        lines.append(f'MODAL_SECRET_TELEGRAM  = "telegram-client-{n}"')
-    else:
-        lines.append(f'MODAL_SECRET_TELEGRAM  = None')
     return "\n".join(lines) + "\n"
 
 
 def _provision_client(
-    name: str, interface: str,
-    tg_token: str, tg_chat: str,
+    name: str,
     github_token: str, github_repo: str,
     modal_id: str, modal_secret_val: str,
     client_id: str,
@@ -132,30 +125,20 @@ def _provision_client(
     n = name.lower()
     _tg(bot_token, chat_id, f"⏳ Skapar *{name.capitalize()}*...")
 
-    # 1. Generate bearer token + store ALL credentials in admin_state BEFORE GitHub push
-    # deploy.py reads from admin_state to create Modal secrets — no REST API needed
+    # 1. Store bearer token in admin_state BEFORE GitHub push
+    # deploy.py reads from admin_state to create the Modal secret
     auth_token = secrets.token_hex(32)
     clients_map = admin_state.get("clients", {})
-    clients_map[n] = {
-        "auth_token": auth_token,
-        "interface": interface,
-        "tg_token": tg_token if interface == "telegram" else None,
-        "tg_chat": tg_chat if interface == "telegram" else None,
-    }
+    clients_map[n] = {"auth_token": auth_token}
     admin_state["clients"] = clients_map
 
-    # 2. Set Telegram webhook
-    if interface == "telegram" and tg_token and tg_chat:
-        webhook_url = f"https://{WORKSPACE}--calendar-{n}-telegram-webhook.modal.run"
-        _set_webhook(tg_token, webhook_url)
-
-    # 3. Push clients/{n}.py to GitHub → triggers GitHub Actions deploy
+    # 2. Push clients/{n}.py to GitHub → triggers GitHub Actions deploy
     ok = _github_file(
         repo=github_repo,
         path=f"clients/{n}.py",
-        content=_build_client_file(name, interface),
+        content=_build_client_file(name),
         token=github_token,
-        message=f"Add client {name} ({interface})",
+        message=f"Add client {name}",
     )
     if not ok:
         _tg(bot_token, chat_id, "❌ Kunde inte pusha till GitHub. Kontrollera `github-api-token`.")
@@ -163,7 +146,7 @@ def _provision_client(
 
     _tg(bot_token, chat_id, f"✅ `clients/{n}.py` pushad — GitHub Actions deployas (~2 min)...")
 
-    # 4. Build OAuth URL
+    # 3. Build OAuth URL
     params = {
         "client_id": client_id,
         "redirect_uri": OAUTH_CALLBACK_URL,
@@ -175,12 +158,11 @@ def _provision_client(
     }
     oauth_url = "https://accounts.google.com/o/oauth2/v2/auth?" + urllib.parse.urlencode(params)
 
-    iface_note = "Telegram webhook satt ✅" if interface == "telegram" else "Slack — klistra in cURL i n8n"
     _tg(
         bot_token, chat_id,
         f"*{name.capitalize()} är redo!*\n\n"
         f"🔑 Bearer: `{auth_token}`\n"
-        f"📲 {iface_note}",
+        f"📲 Slack — klistra in cURL i n8n",
     )
     _tg_button(
         bot_token, chat_id,
@@ -237,45 +219,17 @@ def handle_update(update: dict) -> dict:
             admin_state["state"] = {"step": "awaiting_name"}
             _tg(bot_token, chat_id, "Vad ska klienten heta?")
         else:
-            admin_state["state"] = {"step": "awaiting_interface", "client_name": name}
-            _tg(bot_token, chat_id, f"Klient: *{name}*\n\nVilket interface — *Slack* eller *Telegram*?")
+            admin_state["state"] = {"step": "idle"}
+            _provision_client(name, github_token, github_repo, modal_id, modal_secret_val,
+                              client_id, bot_token, chat_id)
         return {"ok": True}
 
     # ── Awaiting name ─────────────────────────────────────────────────────────
     if step == "awaiting_name" and text:
         name = text.split()[0].capitalize()
-        admin_state["state"] = {"step": "awaiting_interface", "client_name": name}
-        _tg(bot_token, chat_id, f"Klient: *{name}*\n\nVilket interface — *Slack* eller *Telegram*?")
-        return {"ok": True}
-
-    # ── Awaiting interface ────────────────────────────────────────────────────
-    if step == "awaiting_interface":
-        name = state["client_name"]
-        if "telegram" in text_lower:
-            admin_state["state"] = {**state, "step": "awaiting_telegram_creds", "interface": "telegram"}
-            _tg(bot_token, chat_id,
-                f"*Bot token* och *chat ID* för {name}s bot:\n\nFormat: `TOKEN / CHAT_ID`")
-        elif "slack" in text_lower:
-            admin_state["state"] = {"step": "idle"}
-            _provision_client(name, "slack", None, None,
-                              github_token, github_repo, modal_id, modal_secret_val,
-                              client_id, bot_token, chat_id)
-        else:
-            _tg(bot_token, chat_id, "Skriv *Slack* eller *Telegram*.")
-        return {"ok": True}
-
-    # ── Awaiting Telegram credentials ─────────────────────────────────────────
-    if step == "awaiting_telegram_creds":
-        name = state["client_name"]
-        if "/" not in text:
-            _tg(bot_token, chat_id, "Format: `TOKEN / CHAT_ID` — försök igen.")
-            return {"ok": True}
-        parts = [p.strip() for p in text.split("/", 1)]
-        tg_token_val, tg_chat_val = parts[0], parts[1]
         admin_state["state"] = {"step": "idle"}
-        _provision_client(name, "telegram", tg_token_val, tg_chat_val,
-                         github_token, github_repo, modal_id, modal_secret_val,
-                         client_id, bot_token, chat_id)
+        _provision_client(name, github_token, github_repo, modal_id, modal_secret_val,
+                          client_id, bot_token, chat_id)
         return {"ok": True}
 
     # ── "avbryt" ─────────────────────────────────────────────────────────────
