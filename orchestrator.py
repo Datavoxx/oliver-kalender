@@ -13,28 +13,23 @@ image = (
 
 orchestrator_state = modal.Dict.from_name(config.MODAL_DICT_NAME, create_if_missing=True)
 
+_main_secrets = [
+    modal.Secret.from_name(config.MODAL_SECRET_OPENAI),
+    modal.Secret.from_name(config.MODAL_SECRET_AUTH),
+    modal.Secret.from_name(config.MODAL_SECRET_GOOGLE),
+]
 
-@app.function(
-    image=image,
-    secrets=[
-        modal.Secret.from_name(config.MODAL_SECRET_OPENAI),
-        modal.Secret.from_name(config.MODAL_SECRET_AUTH),
-        modal.Secret.from_name(config.MODAL_SECRET_GOOGLE),
-    ],
-    timeout=60,
-    min_containers=1,
-)
-@modal.fastapi_endpoint(method="POST")
-def handle_message(data: dict, authorization: str = Header(None)) -> dict:
-    """
-    Orchestrator endpoint. Receives Slack messages, manages conversation state,
-    classifies intent(s), and executes Google Calendar operations directly.
 
-    Input:  { message: str, user_id: str }
-    Output: { reply: str }
+# ── Core orchestrator logic ───────────────────────────────────────────────────
+
+def _run_orchestrator(message: str, user_id: str) -> str:
     """
-    import os
-    import json
+    Process a message for a given user. Manages conversation state,
+    calls the LLM, and executes Google Calendar operations.
+    Returns the reply string.
+    Must be called from within a Modal function with the required secrets loaded.
+    """
+    import os, json
     from openai import OpenAI
     from lib.prompt import SYSTEM_PROMPT
     from lib.formatters import (
@@ -49,20 +44,6 @@ def handle_message(data: dict, authorization: str = Header(None)) -> dict:
     )
     from lib.calendar_client import CalendarClient
 
-    # ── Auth ──────────────────────────────────────────────────────────────────
-    expected_token = os.environ.get("API_AUTH_TOKEN")
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing authorization header")
-    if authorization.replace("Bearer ", "") != expected_token:
-        raise HTTPException(status_code=403, detail="Invalid token")
-
-    message = data.get("message", "").strip()
-    user_id = data.get("user_id", "anonymous")
-
-    if not message:
-        raise HTTPException(status_code=400, detail="'message' is required")
-
-    # ── Load state & credentials ───────────────────────────────────────────────
     state = orchestrator_state.get(user_id, default_state())
     event_history = state.get("event_history", [])
     conversation = state.get("conversation", [])
@@ -70,7 +51,6 @@ def handle_message(data: dict, authorization: str = Header(None)) -> dict:
     creds_data = json.loads(os.environ.get("GOOGLE_CALENDAR_CREDENTIALS", "{}"))
     cal = CalendarClient(creds_data, event_history)
 
-    # ── Call LLM orchestrator ──────────────────────────────────────────────────
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M (%A)")
     client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
@@ -83,7 +63,6 @@ def handle_message(data: dict, authorization: str = Header(None)) -> dict:
         last_reply=state.get("last_reply") or "none",
     )
 
-    # Operation item schema (reused in array)
     operation_schema = {
         "type": "object",
         "properties": {
@@ -110,10 +89,7 @@ def handle_message(data: dict, authorization: str = Header(None)) -> dict:
                 "schema": {
                     "type": "object",
                     "properties": {
-                        "operations": {
-                            "type": "array",
-                            "items": operation_schema,
-                        },
+                        "operations": {"type": "array", "items": operation_schema},
                         "reply": {"type": "string"},
                         "all_ready": {"type": "boolean"},
                     },
@@ -131,8 +107,7 @@ def handle_message(data: dict, authorization: str = Header(None)) -> dict:
 
     llm = json.loads(response.choices[0].message.content)
 
-    def _save_and_reply(reply_text: str, new_state: dict, reset_conversation: bool = False) -> dict:
-        """Save conversation turn to state and return reply."""
+    def _save(reply_text: str, new_state: dict, reset_conversation: bool = False) -> str:
         base = [] if reset_conversation else conversation
         new_conv = base + [
             {"role": "user", "content": message},
@@ -140,36 +115,35 @@ def handle_message(data: dict, authorization: str = Header(None)) -> dict:
         ]
         new_state["conversation"] = new_conv[-10:]
         orchestrator_state[user_id] = new_state
-        return {"reply": reply_text}
+        return reply_text
 
     operations = llm.get("operations", [])
     if not operations:
-        return _save_and_reply(
+        return _save(
             "Vad vill du göra? Jag kan boka, ändra eller ta bort events i din kalender.",
             default_state(event_history),
         )
 
-    # ── Single chat / unclear op ───────────────────────────────────────────────
+    # ── Single chat / unclear ─────────────────────────────────────────────────
     if len(operations) == 1:
         op = operations[0]
         intent = op.get("intent", "unclear")
 
-        # Handle cancelled
         if op.get("cancelled"):
-            reply_text = op.get("reply") or llm.get("reply") or "Okej, inget ändrat."
-            return _save_and_reply(reply_text, default_state(event_history))
+            return _save(op.get("reply") or "Okej, inget ändrat.", default_state(event_history))
 
         if intent in ("chat", "unclear"):
-            reply_text = op.get("reply") or llm.get("reply") or "Vad vill du göra?"
-            return _save_and_reply(reply_text, default_state(event_history, last_reply=state.get("last_reply", "")))
+            return _save(
+                op.get("reply") or "Vad vill du göra?",
+                default_state(event_history, last_reply=state.get("last_reply", "")),
+            )
 
-    # ── Not all ready — ask for missing info ───────────────────────────────────
+    # ── Not all ready — ask for missing info ──────────────────────────────────
     if not llm.get("all_ready"):
         reply_text = llm.get("reply") or "Kan du berätta mer?"
-        # Persist the first incomplete single op for continuation
         if len(operations) == 1:
             op = operations[0]
-            return _save_and_reply(reply_text, {
+            return _save(reply_text, {
                 "intent": op.get("intent"),
                 "fields": {**state.get("fields", {}), **op.get("fields", {})},
                 "missing": op.get("missing", []),
@@ -178,8 +152,7 @@ def handle_message(data: dict, authorization: str = Header(None)) -> dict:
                 "last_reply": state.get("last_reply", ""),
                 "pending_operations": [],
             })
-        # Multiple ops — persist all for follow-up
-        return _save_and_reply(reply_text, {
+        return _save(reply_text, {
             "intent": None,
             "fields": {},
             "missing": [],
@@ -189,7 +162,7 @@ def handle_message(data: dict, authorization: str = Header(None)) -> dict:
             "pending_operations": operations,
         })
 
-    # ── Execute all ready operations ───────────────────────────────────────────
+    # ── Execute all ready operations ──────────────────────────────────────────
     confirmations = []
     new_history = event_history
 
@@ -208,7 +181,6 @@ def handle_message(data: dict, authorization: str = Header(None)) -> dict:
             continue
 
         if intent == "create":
-            # Safety: catch missing or hallucinated 00:00 start time
             start_dt_str = fields.get("start_datetime", "")
             msg_lower = message.lower()
             conv_text = " ".join(m.get("content", "") for m in conversation).lower()
@@ -217,7 +189,6 @@ def handle_message(data: dict, authorization: str = Header(None)) -> dict:
                 confirmations.append(f"Kunde inte boka '{fields.get('title', 'event')}' — tid saknas. Berätta vilken tid!")
                 continue
 
-            # Safety: end_datetime <= start_datetime → assume crosses midnight
             from datetime import timedelta
             start_dt = datetime.fromisoformat(fields["start_datetime"])
             end_dt = datetime.fromisoformat(fields["end_datetime"])
@@ -304,186 +275,87 @@ def handle_message(data: dict, authorization: str = Header(None)) -> dict:
             events = cal.list_events(date_str)
             confirmations.append(format_events_list(events, date_str))
 
-    reply = "\n\n".join(c for c in confirmations if c)
-    if not reply:
-        reply = "Klart!"
-
-    return _save_and_reply(reply, default_state(new_history, last_reply=reply), reset_conversation=True)
+    reply = "\n\n".join(c for c in confirmations if c) or "Klart!"
+    return _save(reply, default_state(new_history, last_reply=reply), reset_conversation=True)
 
 
-# ── OAuth helpers ──────────────────────────────────────────────────────────────
-
-def _send_telegram(bot_token: str, chat_id: str, text: str) -> None:
-    """Send a message to Telegram. Fails silently."""
-    import requests
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{bot_token}/sendMessage",
-            json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"},
-            timeout=10,
-        )
-    except Exception:
-        pass
-
-
-def _create_modal_secret(secret_name: str, env_vars: dict, token_id: str, token_secret: str, workspace: str) -> tuple:
-    """Create or update a Modal secret via REST API. Returns (ok, error_text)."""
-    import requests
-    try:
-        resp = requests.put(
-            f"https://api.modal.com/v1/secrets/{secret_name}",
-            headers={
-                "Authorization": f"Token {token_id}:{token_secret}",
-                "Content-Type": "application/json",
-            },
-            json={"workspace_name": workspace, "env_vars": env_vars},
-            timeout=15,
-        )
-        return resp.ok, "" if resp.ok else resp.text
-    except Exception as e:
-        return False, str(e)
-
-
-# ── OAuth endpoints ────────────────────────────────────────────────────────────
-
-_oauth_image = (
-    modal.Image.debian_slim()
-    .pip_install("fastapi", "requests")
-    .add_local_python_source("config")
-)
-
+# ── Slack / n8n endpoint ──────────────────────────────────────────────────────
 
 @app.function(
-    image=_oauth_image,
-    secrets=[
-        modal.Secret.from_name(config.MODAL_SECRET_OAUTH),
-        modal.Secret.from_name("telegram-notifier"),
-    ],
+    image=image,
+    secrets=_main_secrets,
+    timeout=60,
+    min_containers=1,
 )
-@modal.fastapi_endpoint(method="GET")
-def auth_start(client: str = "klient"):
+@modal.fastapi_endpoint(method="POST")
+def handle_message(data: dict, authorization: str = Header(None)) -> dict:
     """
-    Steg 1: Besök /auth/start?client=oliver
-    Skickar Google OAuth-länken till dig via Telegram.
+    HTTP endpoint for Slack / n8n.
+    Input:  { message: str, user_id: str }
+    Output: { reply: str }
     """
-    import os, urllib.parse
-    from fastapi.responses import HTMLResponse
+    import os
 
-    if not config.AUTH_CALLBACK_URL:
-        return HTMLResponse(
-            "<h1>Sätt AUTH_CALLBACK_URL i config.py och redeploya.</h1>"
-            f"<p>Format: <code>https://[workspace]--{config.MODAL_APP_NAME}-auth-callback.modal.run</code></p>",
-            status_code=400,
-        )
+    expected_token = os.environ.get("API_AUTH_TOKEN")
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing authorization header")
+    if authorization.replace("Bearer ", "") != expected_token:
+        raise HTTPException(status_code=403, detail="Invalid token")
 
-    params = {
-        "client_id": os.environ["GOOGLE_CLIENT_ID"],
-        "redirect_uri": config.AUTH_CALLBACK_URL,
-        "response_type": "code",
-        "scope": "https://www.googleapis.com/auth/calendar",
-        "access_type": "offline",
-        "prompt": "consent",
-        "state": client,
-    }
-    google_url = "https://accounts.google.com/o/oauth2/v2/auth?" + urllib.parse.urlencode(params)
+    message = data.get("message", "").strip()
+    user_id = data.get("user_id", "anonymous")
+    if not message:
+        raise HTTPException(status_code=400, detail="'message' is required")
 
-    _send_telegram(
-        bot_token=os.environ["TELEGRAM_BOT_TOKEN"],
-        chat_id=os.environ["TELEGRAM_CHAT_ID"],
-        text=f"*Länk för {client}:*\n{google_url}",
+    return {"reply": _run_orchestrator(message, user_id)}
+
+
+# ── Telegram webhook (only for Telegram-interface clients) ────────────────────
+
+if getattr(config, "INTERFACE", "slack") == "telegram":
+    _tg_secrets = [
+        modal.Secret.from_name(config.MODAL_SECRET_OPENAI),
+        modal.Secret.from_name(config.MODAL_SECRET_GOOGLE),
+        modal.Secret.from_name(config.MODAL_SECRET_TELEGRAM),
+    ]
+
+    @app.function(
+        image=image,
+        secrets=_tg_secrets,
+        timeout=60,
+        min_containers=1,
     )
+    @modal.fastapi_endpoint(method="POST")
+    def telegram_webhook(update: dict) -> dict:
+        """
+        Telegram Bot API webhook. Receives updates from the client's bot,
+        processes the message, and sends the reply back via Telegram.
+        """
+        import os, requests
 
-    return HTMLResponse(
-        f"<h1>Länk skickad till Telegram!</h1>"
-        f"<p>Skicka länken till {client} och be dem klicka på den.</p>"
-    )
+        bot_token = os.environ.get("TELEGRAM_BOT_TOKEN")
 
+        message_obj = update.get("message") or update.get("edited_message")
+        if not message_obj:
+            return {"ok": True}
 
-@app.function(
-    image=_oauth_image,
-    secrets=[
-        modal.Secret.from_name(config.MODAL_SECRET_OAUTH),
-        modal.Secret.from_name("modal-api-token"),
-        modal.Secret.from_name("telegram-notifier"),
-    ],
-)
-@modal.fastapi_endpoint(method="GET")
-def auth_callback(code: str = None, state: str = "klient", error: str = None):
-    """
-    Steg 2: Google redirectar hit efter att klienten godkänt.
-    Skapar Modal secret automatiskt + skickar notis till Telegram.
-    """
-    import os, json, urllib.parse, urllib.request
-    from fastapi.responses import HTMLResponse
+        text = (message_obj.get("text") or "").strip()
+        user_id = str(message_obj["from"]["id"])
+        chat_id = message_obj["chat"]["id"]
 
-    if error:
-        _send_telegram(os.environ["TELEGRAM_BOT_TOKEN"], os.environ["TELEGRAM_CHAT_ID"],
-                       f"*{state}* — Google-fel: {error}")
-        return HTMLResponse(f"<h1>Fel: {error}</h1>", status_code=400)
-    if not code:
-        return HTMLResponse("<h1>Ingen auth-kod mottagen.</h1>", status_code=400)
+        if not text:
+            return {"ok": True}
 
-    client_id = os.environ["GOOGLE_CLIENT_ID"]
-    client_secret = os.environ["GOOGLE_CLIENT_SECRET"]
+        reply = _run_orchestrator(text, user_id)
 
-    # Byt auth-kod mot tokens
-    token_data = urllib.parse.urlencode({
-        "code": code,
-        "client_id": client_id,
-        "client_secret": client_secret,
-        "redirect_uri": config.AUTH_CALLBACK_URL,
-        "grant_type": "authorization_code",
-    }).encode()
+        if reply and bot_token:
+            try:
+                requests.post(
+                    f"https://api.telegram.org/bot{bot_token}/sendMessage",
+                    json={"chat_id": chat_id, "text": reply},
+                    timeout=10,
+                )
+            except Exception:
+                pass
 
-    req = urllib.request.Request(
-        "https://oauth2.googleapis.com/token",
-        data=token_data,
-        method="POST",
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-    )
-    with urllib.request.urlopen(req) as resp:
-        tokens = json.loads(resp.read())
-
-    credentials = {
-        "access_token": tokens.get("access_token", ""),
-        "refresh_token": tokens.get("refresh_token", ""),
-        "client_id": client_id,
-        "client_secret": client_secret,
-        "calendar_id": "primary",
-    }
-
-    # Skapa Modal secret automatiskt
-    secret_name = f"google-calendar-credentials-{state}"
-    ok, _ = _create_modal_secret(
-        secret_name=secret_name,
-        env_vars={"GOOGLE_CALENDAR_CREDENTIALS": json.dumps(credentials)},
-        token_id=os.environ["MODAL_TOKEN_ID"],
-        token_secret=os.environ["MODAL_TOKEN_SECRET"],
-        workspace=os.environ["MODAL_WORKSPACE"],
-    )
-
-    # Bygg cURL-kommando
-    handle_url = f"https://{os.environ['MODAL_WORKSPACE']}--{config.MODAL_APP_NAME}-handle-message.modal.run"
-    curl_cmd = (
-        f'curl -X POST "{handle_url}" \\\n'
-        f'  -H "Content-Type: application/json" \\\n'
-        f'  -H "Authorization: Bearer DITT_TOKEN" \\\n'
-        f'  -d \'{{"message": "hej", "user_id": "{state}"}}\''
-    )
-
-    if ok:
-        status_line = f"*Secret `{secret_name}` skapad automatiskt!*"
-    else:
-        modal_cmd = f'modal secret create {secret_name} GOOGLE_CALENDAR_CREDENTIALS=\'{json.dumps(credentials)}\''
-        status_line = f"*Secret misslyckades* — kor manuellt:\n```\n{modal_cmd}\n```"
-
-    _send_telegram(
-        bot_token=os.environ["TELEGRAM_BOT_TOKEN"],
-        chat_id=os.environ["TELEGRAM_CHAT_ID"],
-        text=f"*{state} ar klar!*\n{status_line}\n\n*cURL:*\n```\n{curl_cmd}\n```",
-    )
-
-    return HTMLResponse(
-        "<h1>Klart! Du kan stanga den har sidan.</h1>"
-        "<p>Kalendern ar nu kopplad.</p>"
-    )
+        return {"ok": True}
