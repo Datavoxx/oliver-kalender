@@ -363,6 +363,12 @@ def oauth_callback(code: str = None, state: str = "klient", error: str = None):
     secret_name = f"google-calendar-credentials-{n}"
     ok = _modal_secret(secret_name, {"GOOGLE_CALENDAR_CREDENTIALS": json.dumps(credentials)}, modal_id, modal_secret_val)
 
+    # Store credentials in admin_state (reliable fallback since REST API may fail)
+    clients_map = admin_state.get("clients", {})
+    if n in clients_map:
+        clients_map[n]["google_credentials"] = credentials
+        admin_state["clients"] = clients_map
+
     # Trigger redeploy via GitHub to restart containers with fresh credentials
     _github_file(
         repo=github_repo,

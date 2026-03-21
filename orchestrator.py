@@ -49,6 +49,14 @@ def _run_orchestrator(message: str, user_id: str) -> str:
     conversation = state.get("conversation", [])
 
     creds_data = json.loads(os.environ.get("GOOGLE_CALENDAR_CREDENTIALS", "{}"))
+    if not creds_data.get("refresh_token"):
+        # Secret is placeholder — read real credentials from admin_state
+        try:
+            admin_dict = modal.Dict.from_name("admin-state", create_if_missing=False)
+            client_info = admin_dict.get("clients", {}).get(config.CLIENT_NAME.lower(), {})
+            creds_data = client_info.get("google_credentials", {})
+        except Exception:
+            pass
     cal = CalendarClient(creds_data, event_history)
 
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M (%A)")
