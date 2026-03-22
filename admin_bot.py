@@ -322,7 +322,7 @@ def oauth_callback(code: str = None, state: str = "klient", error: str = None):
     _github_file(
         repo=github_repo,
         path=f"clients/{n}.py",
-        content=_build_client_file(n, admin_state.get("clients", {}).get(n, {}).get("interface", "slack")),
+        content=_build_client_file(n),
         token=github_token,
         message=f"Redeploy {n} after OAuth",
     )

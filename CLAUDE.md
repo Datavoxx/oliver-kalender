@@ -1,3 +1,5 @@
+@CALENDAR.md
+
 # Agentic Workflows for n8n
 
 This workspace builds Python-powered API endpoints for n8n workflows using Modal.
