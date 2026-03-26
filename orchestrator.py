@@ -12,6 +12,7 @@ image = (
 )
 
 orchestrator_state = modal.Dict.from_name(config.MODAL_DICT_NAME, create_if_missing=True)
+_admin_state = modal.Dict.from_name("admin-state", create_if_missing=True)
 
 _main_secrets = [
     modal.Secret.from_name(config.MODAL_SECRET_OPENAI),
@@ -52,11 +53,11 @@ def _run_orchestrator(message: str, user_id: str) -> str:
     if not creds_data.get("refresh_token"):
         # Secret is placeholder — read real credentials from admin_state
         try:
-            admin_dict = modal.Dict.from_name("admin-state", create_if_missing=False)
-            client_info = admin_dict.get("clients", {}).get(config.CLIENT_NAME.lower(), {})
+            client_key = config.MODAL_APP_NAME.replace("calendar-", "")
+            client_info = _admin_state.get("clients", {}).get(client_key, {})
             creds_data = client_info.get("google_credentials", {})
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"Warning: could not read credentials from admin_state: {e}")
     cal = CalendarClient(creds_data, event_history)
 
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M (%A)")

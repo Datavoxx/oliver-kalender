@@ -22,9 +22,13 @@ class CalendarClient:
     def _get_token(self) -> str:
         import google.oauth2.credentials
         import google.auth.transport.requests
+        from fastapi import HTTPException
+        refresh_token = self.creds_data.get("refresh_token")
+        if not refresh_token:
+            raise HTTPException(status_code=503, detail="Google Calendar not configured — OAuth not completed yet.")
         credentials = google.oauth2.credentials.Credentials(
             token=None,
-            refresh_token=self.creds_data["refresh_token"],
+            refresh_token=refresh_token,
             token_uri="https://oauth2.googleapis.com/token",
             client_id=self.creds_data["client_id"],
             client_secret=self.creds_data["client_secret"],
